@@ -1,0 +1,35 @@
+{
+    "name": "passwd-fdw",
+    "abstract": "A Foreign Data Wrapper (FDW) for unix/linux user database",
+    "description": "A FDW for the user database in /etc/passwd and /etc/group",
+    "version": "0.4.0",
+    "maintainer": "Bear Giles <bgiles@coyotesong.com>",
+    "license": "postgresql",
+    "provides": {
+        "passwd-fdw": {
+            "abstract": "A short description",
+            "file": "sql/passwd-fdw.sql",
+            "docfile": "doc/passwd-fdw.md",
+            "version": "0.4.0"
+        }
+    },
+    "release_status": "unstable",
+    "resources": {
+        "bugtracker": {
+            "web": "https://github.com/beargiles/passwd-fdw"
+        },
+        "repository": {
+          "url":  "git://github.com/beargiles/passwd-fdw.git",
+          "web":  "https://github.com/beargiles/passwd-fdw",
+          "type": "git"
+        }
+    },
+
+    "generated_by": "Bear Giles <bgiles@coyotesong.com>",
+
+
+    "meta-spec": {
+        "version": "1.0.0",
+        "url": "http://pgxn.org/meta/spec.txt"
+    }
+}

@@ -1,0 +1,9 @@
+\set ECHO 0
+-- You should write your tests
+SELECT passwd-fdw('test');
+ passwd-fdw 
+------------
+ 
+(1 row)
+
+ROLLBACK;

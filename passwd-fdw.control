@@ -1,0 +1,5 @@
+# passwd-fdw extension
+comment = 'A short description'
+default_version = '0.4.0'
+module_pathname = '$libdir/passwd-fdw'
+relocatable = true
