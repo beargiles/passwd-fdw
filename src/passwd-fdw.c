@@ -10,6 +10,7 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <pwd.h>
 #include <grp.h>
 
@@ -67,14 +68,22 @@ static void passwdEndForeignScan(ForeignScanState *node);
 #define BUFLEN 2048
 
 /*
+ * Options information for FDW calls.
+ */
+typedef struct passwdFdwOption {
+	enum Mode {
+		PASSWORD_MODE, GROUP_MODE
+	} mode;
+	int min_uid;
+} PasswdFdwOption;
+
+static PasswdFdwOption *passwd_get_options(Oid foreignoid);
+
+/*
  * State information for FDW calls.
  */
 typedef struct passwdFdwState {
-	enum Mode {
-		PASSWORD_MODE,
-		GROUP_MODE
-	} mode;
-	int min_uid;
+	PasswdFdwOption *opt;
 
 	int initialized;
 	int rownum;
@@ -88,15 +97,7 @@ typedef struct passwdFdwState {
 
 	// field used to map fields to columns.
 	enum Field {
-		NAME,
-		PASSWORD,
-		UID,
-		GID,
-		GECOS,
-		DIR,
-		SHELL,
-		MEMBERS,
-		LAST
+		NAME, PASSWORD, UID, GID, GECOS, DIR, SHELL, MEMBERS, LAST
 	};
 	int pos[LAST];
 } PasswdFdwState;
@@ -127,11 +128,107 @@ Datum passwd_fdw_handler(PG_FUNCTION_ARGS) {
 }
 
 /*
- * Passwd FDW validator. There is nothing to validate since the file
- * is in a standard location.
+ * Passwd FDW validator.
+ *
+ * SECURITY WARNING: we do not sanitize user-provided values in our ereport()
+ * calls. This might cause corruption of our log files, or worse.
  */
 Datum passwd_fdw_validator(PG_FUNCTION_ARGS) {
+	List *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+	ListCell *cell;
+	Oid catalog = PG_GETARG_OID(1);
+
+	if (catalog == ForeignTableRelationId)
+		foreach(cell, options_list)
+		{
+			DefElem *def = (DefElem *) lfirst(cell);
+			// security: should sanitize value.
+			char *value = defGetString(def);
+
+			if (strcasecmp(def->defname, "file") == 0) {
+				if (tolower(*value) == 'p' && strcasecmp(value, "passwd") == 0) {
+					// valid
+				} else if (tolower(*value) == 'g' && strcasecmp(value, "group") == 0) {
+					// valid
+				} else {
+					ereport(ERROR,
+							(errcode(ERRCODE_FDW_INVALID_OPTION_NAME), errmsg("invalid value for \"%s\": \"%s\"", def->defname, value), errhint("Valid options in this context are: file (passwd,group)")));
+				}
+			} else if (strcasecmp(def->defname, "min_uid") == 0) {
+				// FIXME: verify this is a non-negative number.
+			} else {
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME), errmsg("invalid option \"%s\"", def->defname), errhint("Valid options in this context are: file (passwd,group), min_uid") ));
+			}
+		}
+	else if (options_list != NULL && options_list->length > 0) {
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME), errmsg("invalid option: there are no options in this context."), errhint("Valid options in this context are: <none>") ));
+	}
+
 	PG_RETURN_VOID() ;
+}
+
+/**
+ * Fetch the options.
+ */
+static PasswdFdwOption *passwd_get_options(Oid foreignoid) {
+	ForeignTable *f_table = NULL;
+	ForeignServer *f_server = NULL;
+	// UserMapping *f_mapping;
+	List *options;
+	ListCell *lc;
+	PasswdFdwOption *opt;
+
+	opt = (PasswdFdwOption*) palloc(sizeof(PasswdFdwOption));
+	memset(opt, 0, sizeof(PasswdFdwOption));
+
+	opt->mode = PASSWORD_MODE;
+
+	/*
+	 * Extract options from FDW objects.
+	 */
+	PG_TRY();
+		{
+			f_table = GetForeignTable(foreignoid);
+			f_server = GetForeignServer(f_table->serverid);
+		}
+	PG_CATCH();
+		{
+			f_table = NULL;
+			f_server = GetForeignServer(foreignoid);
+		}
+	PG_END_TRY();
+
+	// f_mapping = GetUserMapping(GetUserId(), f_server->serverid);
+
+	options = NIL;
+	if (f_table)
+		options = list_concat(options, f_table->options);
+	options = list_concat(options, f_server->options);
+	// options = list_concat(options, f_mapping->options);
+
+	opt->mode = PASSWORD_MODE;
+
+	// Loop through the options
+	foreach(lc, options)
+	{
+		DefElem *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "file") == 0)
+			if (strcasecmp(defGetString(def), "group") == 0) {
+				opt->mode = GROUP_MODE;
+			}
+
+		if (strcmp(def->defname, "min_uid") == 0) {
+			opt->min_uid = atoi(defGetString(def));
+			if (opt->min_uid < 0) {
+				opt->min_uid = 0;
+			}
+		}
+	}
+
+	return opt;
 }
 
 /*
@@ -142,16 +239,27 @@ Datum passwd_fdw_validator(PG_FUNCTION_ARGS) {
 static void passwdGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 		Oid foreigntableid) {
 
+	PasswdFdwOption *options = passwd_get_options(foreigntableid);
 	PasswdFdwState *state = (PasswdFdwState *) palloc(sizeof(PasswdFdwState));
-	struct passwd pw;
+
+	options->mode = PASSWORD_MODE;
 
 	baserel->rows = 0;
-	// fixme: handle groups
-	setpwent();
-	while (getpwent_r(&pw, state->buf, sizeof(state->buf), &state->pwp) == 0) {
-		baserel->rows++;
+	if (options->mode == PASSWORD_MODE) {
+		struct passwd pw;
+		setpwent();
+		while (getpwent_r(&pw, state->buf, sizeof(state->buf), &state->pwp) == 0) {
+			baserel->rows++;
+		}
+		endpwent();
+	} else if (options->mode == GROUP_MODE) {
+		struct group gr;
+		setgrent();
+		while (getgrent_r(&gr, state->buf, sizeof(state->buf), &state->grp) == 0) {
+			baserel->rows++;
+		}
+		endgrent();
 	}
-	endpwent();
 
 	pfree(state);
 }
@@ -180,18 +288,22 @@ passwdGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 		ForeignPath *best_path, List *tlist, List *scan_clauses) {
 	Index scan_relid = baserel->relid;
 	Datum blob = 0;
-	Const *blob2 = makeConst(INTERNALOID, 0, 0, sizeof(blob), blob,
+	Const *fwd_private = makeConst(INTERNALOID, 0, 0, sizeof(blob), blob,
 	false, false);
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 	return make_foreignscan(tlist, scan_clauses, scan_relid, scan_clauses,
-			(void *) blob2);
+			(void *) fwd_private
+#if PG_VERSION_NUM >= 90500
+			, NIL
+#endif
+			);
 }
 
 /*
  * Give brief explanation.
  */
 static void passwdExplainForeignScan(ForeignScanState *node, ExplainState *es) {
-	ExplainPropertyText("Passwd", "Scan /etc/passwd", es);
+	ExplainPropertyText("Passwd", "Scan /etc/passwd or /etc/group", es);
 }
 
 /*
@@ -210,8 +322,10 @@ static void passwdBeginForeignScan(ForeignScanState *node, int eflags) {
 	}
 
 	state = (PasswdFdwState *) palloc(sizeof(PasswdFdwState));
-	state->mode = PASSWORD_MODE;
-	state->min_uid = 0;
+	memset(state, 0, sizeof(PasswdFdwState));
+
+	state->opt = passwd_get_options(
+			RelationGetRelid(node->ss.ss_currentRelation));
 
 	state->initialized = 1;
 	state->last_ret_value = 0;
@@ -268,7 +382,7 @@ static void passwdBeginForeignScan(ForeignScanState *node, int eflags) {
 		}
 	}
 
-	if (state->mode == PASSWORD_MODE) {
+	if (state->opt->mode == PASSWORD_MODE) {
 		setpwent();
 	} else {
 		setgrent();
@@ -297,11 +411,11 @@ passwdIterateForeignScan(ForeignScanState *node) {
 
 	// read next entry. Note that we may have to read multple password
 	// entries if we have a minimum UID specified.
-	if (state->mode == PASSWORD_MODE) {
+	if (state->opt->mode == PASSWORD_MODE) {
 		do {
-			state->last_ret_value = getpwent_r(&pw, state->buf, sizeof(state->buf),
-					&state->pwp);
-		} while (state->last_ret_value != 0 && pw.pw_uid < state->min_uid);
+			state->last_ret_value = getpwent_r(&pw, state->buf,
+					sizeof(state->buf), &state->pwp);
+		} while (state->last_ret_value != 0 && pw.pw_uid < state->opt->min_uid);
 	} else {
 		state->last_ret_value = getgrent_r(&gr, state->buf, sizeof(state->buf),
 				&state->grp);
@@ -324,13 +438,13 @@ passwdIterateForeignScan(ForeignScanState *node) {
 	// populate fields.
 	if (state->pos[NAME] > -1) {
 		values[state->pos[NAME]] =
-				(state->mode == PASSWORD_MODE) ? pw.pw_name : gr.gr_name;
+				(state->opt->mode == PASSWORD_MODE) ? pw.pw_name : gr.gr_name;
 	}
 	if (state->pos[PASSWORD] > -1) {
 		values[state->pos[PASSWORD]] = "*";
 	}
 	if (state->pos[UID] > -1) {
-		if (state->mode == PASSWORD_MODE) {
+		if (state->opt->mode == PASSWORD_MODE) {
 			char *buf = palloc(10);
 			snprintf(buf, 10, "%d", pw.pw_uid);
 			values[state->pos[UID]] = buf;
@@ -338,46 +452,47 @@ passwdIterateForeignScan(ForeignScanState *node) {
 	}
 	if (state->pos[GID] > -1) {
 		char *buf = palloc(10);
-		snprintf(buf, 10, "%d", (state->mode == PASSWORD_MODE) ? pw.pw_gid : gr.gr_gid);
+		snprintf(buf, 10, "%d",
+				(state->opt->mode == PASSWORD_MODE) ? pw.pw_gid : gr.gr_gid);
 		values[state->pos[GID]] = buf;
 	}
 	if (state->pos[GECOS] > -1) {
-		if (state->mode == PASSWORD_MODE) {
+		if (state->opt->mode == PASSWORD_MODE) {
 			values[state->pos[GECOS]] = pw.pw_gecos;
 		}
 	}
 	if (state->pos[DIR] > -1) {
-		if (state->mode == PASSWORD_MODE) {
+		if (state->opt->mode == PASSWORD_MODE) {
 			values[state->pos[DIR]] = pw.pw_dir;
 		}
 	}
 	if (state->pos[SHELL] > -1) {
-		if (state->mode == PASSWORD_MODE) {
-		values[state->pos[SHELL]] = pw.pw_shell;
+		if (state->opt->mode == PASSWORD_MODE) {
+			values[state->pos[SHELL]] = pw.pw_shell;
 		}
 	}
 	if (state->pos[MEMBERS] > -1 && gr.gr_mem != NULL && gr.gr_mem[0] != NULL) {
-		if (state->mode == GROUP_MODE) {
-		int n, len = 0;
-		char *p;
-		for (i = 0; gr.gr_mem[i] != NULL; i++) {
-			len += strlen(gr.gr_mem[i]) + 3;
-		}
-		values[state->pos[MEMBERS]] = p = palloc(len);
-		*p++ = '{';
-		len--;
-		for (i = 0; gr.gr_mem[i] != NULL; i++) {
-			n = strlen(gr.gr_mem[i]);
-			if (n + 1 > len) {
-				break;
+		if (state->opt->mode == GROUP_MODE) {
+			int n, len = 0;
+			char *p;
+			for (i = 0; gr.gr_mem[i] != NULL; i++) {
+				len += strlen(gr.gr_mem[i]) + 3;
 			}
-			strncpy(p, gr.gr_mem[i], n);
-			p += n;
-			*p++ = ',';
-			len -= n + 1;
-		}
-		p[-1] = '}';
-		*p++ = '\0';
+			values[state->pos[MEMBERS]] = p = palloc(len);
+			*p++ = '{';
+			len--;
+			for (i = 0; gr.gr_mem[i] != NULL; i++) {
+				n = strlen(gr.gr_mem[i]);
+				if (n + 1 > len) {
+					break;
+				}
+				strncpy(p, gr.gr_mem[i], n);
+				p += n;
+				*p++ = ',';
+				len -= n + 1;
+			}
+			p[-1] = '}';
+			*p++ = '\0';
 		}
 	}
 
@@ -396,7 +511,7 @@ static void passwdReScanForeignScan(ForeignScanState *node) {
 
 	// check for valid state.
 	if (state->initialized) {
-		if (state->mode == PASSWORD_MODE) {
+		if (state->opt->mode == PASSWORD_MODE) {
 			endpwent();
 		} else {
 			endgrent();
@@ -407,7 +522,7 @@ static void passwdReScanForeignScan(ForeignScanState *node) {
 	state->last_ret_value = 0;
 	state->rownum = 0;
 
-	if (state->mode == PASSWORD_MODE) {
+	if (state->opt->mode == PASSWORD_MODE) {
 		setpwent();
 	} else {
 		setgrent();
@@ -421,7 +536,7 @@ static void passwdEndForeignScan(ForeignScanState *node) {
 	PasswdFdwState *state = (PasswdFdwState *) node->fdw_state;
 
 	if (state->initialized) {
-		if (state->mode == PASSWORD_MODE) {
+		if (state->opt->mode == PASSWORD_MODE) {
 			endpwent();
 		} else {
 			endgrent();

@@ -3,18 +3,8 @@ BEGIN;
 \i sql/passwd-fdw.sql
 \set ECHO all
 
-CREATE SERVER passwd_svr FOREIGN DATA WRAPPER passwd_fdw;
+SELECT * FROM etc_passwd;
 
-CREATE FOREIGN TABLE passwd(
-   name   text,
-   passwd text,
-   uid    int,
-   gid    int,
-   gecos  text,
-   dir    text,
-   shell  text
-) SERVER passwd_svr;
-
-SELECT * FROM passwd;
+SELECT * FROM etc_group;
 
 ROLLBACK;
